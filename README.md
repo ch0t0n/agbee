@@ -1,4 +1,4 @@
-# Supplementary code: anatomy-guided bumble bee identification
+# Anatomy-guided bumble bee identification
 
 This repository contains code and datasets to reproduce the experiments in the paper *An Evaluation of Anatomy-Guided Learning Strategies for Bumble Bee Identification on a Production Citizen-Science Platform*.
 
