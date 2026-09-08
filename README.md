@@ -1,6 +1,6 @@
 # Supplementary code: anatomy-guided bumble bee identification
 
-This package reproduces the experiments in the IAAI-27 paper *An Evaluation of Anatomy-Guided Learning Strategies for Bumble Bee Identification on a Production Citizen-Science Platform* and its appendix.
+This repository contains code and datasets to reproduce the experiments in the paper *An Evaluation of Anatomy-Guided Learning Strategies for Bumble Bee Identification on a Production Citizen-Science Platform*.
 
 It compares seven mechanisms for combining part-level anatomy with a whole-image classifier (whole-image reference, body-masked input, multi-task supervision, part-crop late fusion, attention-pooled part fusion, descriptor concatenation, gated residual fusion) on three datasets, then runs the capacity, heavy-augmentation, calibration, robustness, gated-deployment, and FinerCAM analyses reported in the paper.
 
