@@ -1,0 +1,464 @@
+# Shared paths and experiment defaults.
+# Select dataset via top-level `dataset` or CLI `--dataset` / env `DATASET`.
+# Override roots via env PARTWHOLE_ROOT / LARGE_CLS_ROOT.
+
+seed: 42
+# Seeds repeated for every (fusion arm, mask source, descriptor group) cell
+# in `stage_b.py ablate`; drives the bootstrap CIs / paired significance
+# tests in `stage_report.py ablation_table`. `seed` above stays the default
+# for single-run commands (Stage A sweeps, demos, etc.).
+#
+# Every dataset runs this full seed grid, so every cell on every dataset
+# carries a bootstrap confidence interval and a paired significance test.
+# config.py::load_config still supports a per-dataset `seeds` override; no
+# dataset uses one.
+seeds: [13, 42, 77]
+image_size: 320
+cls_image_size: 224
+num_workers: 4
+
+# Decoded-image cache of pre-resized uint8 arrays. Disable with `enabled: false`
+# or env BEEMACHINE_CACHE=0. Override the location with env BEEMACHINE_CACHE_ROOT.
+#
+# /dev/shm is tmpfs, i.e. RAM: a single .npy there, opened with mmap_mode='r',
+# is shared by every concurrent training job and every DataLoader worker, which
+# is the property this cache exists for. Approximate footprints at 320 px:
+#   beemachine part set          3.2 GB   (7.7k images + masks)
+#   beemachine train_aug (x6)   14.1 GB   (34.5k images + masks)
+#   beemachine scale corpus     ~53 GB    (171k images, Stage C only)
+# Point this at a disk path instead if the machine has too little RAM; that
+# still avoids re-decoding, it just loses the shared-pages property.
+cache:
+  enabled: true
+  root: "/dev/shm/beemachine_cache"
+
+# Active dataset: beemachine | cub | fish_vista
+dataset: beemachine
+
+# Experiment protocols. Select with `--protocol` (or env BEEMACHINE_PROTOCOL);
+# omit for `default`. Each non-default protocol re-runs the same seven
+# comparison arms with exactly ONE variable changed, and writes to run
+# directories suffixed with its `run_tag` so it never overwrites the default
+# grid. Results from these two land in the appendix, not the main comparison.
+#
+# `default` is deliberately empty and MUST stay that way. A run without
+# --protocol has to resolve to byte-identical config, output paths and resume
+# markers as before protocols existed -- that is what allowed this to be added
+# while a full campaign was mid-flight. tests/test_config.py asserts it.
+protocols:
+  default: {}
+
+  # Every arm at a larger input resolution. For an anatomy-guided arm the
+  # meaningful form of "more capacity" is more pixels on each part, not more
+  # parameters: PartCropDataset cuts each part from the image tensor at
+  # cls_image_size and resizes back, so raising it is what actually gives the
+  # crop-based arms more detail per part.
+  #
+  # 384, not the 300/299 that would match the part annotations' native scale:
+  # every one of the nine Stage A decoders and the multi-task arm's
+  # DeepLabV3+/ConvNeXt-Nano needs an input divisible by 32. Measured on this
+  # machine, 0 of 9 architectures forward at either 299 or 300; 288, 320 and
+  # 384 all give 9 of 9. 384 is also the only workable value ABOVE Beemachine's
+  # 320 default, so it is the only one that is genuinely "bigger images" for
+  # all three datasets rather than smaller for one of them.
+  #
+  # Caveat to state rather than hide: Stage A produces masks at `image_size`
+  # (320). At 384 the mask is nearest-upsampled from 320, so the crop gains RGB
+  # detail but the mask BOUNDARY gains no sharpness.
+  # Named for what it changes (input resolution), not for the confound it
+  # probes. `capacity_matched` named this AND the larger-backbone comparison
+  # arm, which changes weights at fixed resolution -- see config.py's
+  # PROTOCOL_CHOICES. The arm kept the old name; this did not.
+  resolution_384:
+    cls_image_size: 384
+    run_tag: "__res384"
+
+  # Every arm under the Mixup / CutMix / RandomErasing recipe that used to be
+  # a single whole-image control arm. Applied to all seven arms so a
+  # regularization advantage cannot be mistaken for an anatomical one.
+  heavy_aug:
+    heavy_augmentation: true
+    run_tag: "__haug"
+
+compute:
+  # Parallel training pool size (one model per GPU). -1 = all visible GPUs.
+  num_gpus: -1
+
+# Shared defaults; per-dataset entries override paths / parts / split policy.
+paths:
+  output_root: "./outputs"   # resolved to ./outputs/{dataset} unless absolute override set per dataset
+  seg_checkpoint: ""
+
+splits:
+  ratios: [0.75, 0.15, 0.10]
+  filename: "splits_seed42.json"
+  cls_filename: "splits_cls_seed42.json"
+  freeze_subdir: "frozen_splits"
+
+# Train-only geometric aug for Stage A (reference protocol). Val/test never augmented.
+augmentation:
+  transforms:
+    - original
+    - horizontal_flip
+    - vertical_flip
+    - "90_rotation"
+    - "180_rotation"
+    - "270_rotation"
+  suffixes:
+    original: orig
+    horizontal_flip: flip_h
+    vertical_flip: flip_v
+    "90_rotation": rot90
+    "180_rotation": rot180
+    "270_rotation": rot270
+
+datasets:
+  beemachine:
+    layout: beemachine_v6
+    split_policy: stratified_freeze
+    # One resolution for segmentation, classification, and the learned NR-IQA
+    # branch. 320 (not 300): every SMP architecture in the Stage A sweep needs
+    # an input divisible by 32 -- at 300 all 8 fail with "Expected image height
+    # and width divisible by 16", and even 304 only satisfies 3 of the 8. The
+    # nearest workable values are 288 and 320; 320 keeps the most detail for
+    # small parts (head/thorax) while staying close to the 300px range the
+    # part annotations were drawn at.
+    image_size: 320
+    cls_image_size: 320
+    # Empty, matching the now-empty global map: every Beemachine arm runs at
+    # cls_image_size (320) so that segmentation, classification, and the NR-IQA
+    # branch share one resolution and no arm differs from another in input size.
+    image_size_overrides: {}
+    part_labels: ["background", "abdomen", "head", "thorax"]
+    # Beemachine classification runs on the full 171,227-image corpus with
+    # confidence-gated pseudo-masks, matching CUB and Fish-Vista, NOT the
+    # 7,716-image pixel-annotated part set. The part set is Stage A only --
+    # it trains and evaluates the segmenter; using it for classification too
+    # produced a tail of species with as few as 1 training photograph, which
+    # is not comparable to the deployed model's actual species coverage
+    # (large corpus is capped at 3,000/species with a minimum of 7).
+    #
+    # Consequence stated rather than hidden: no dataset in this study now has
+    # a ground-truth-mask classification regime. RQ3 (does the fusion-mechanism
+    # ranking degrade from ground-truth to predicted masks?) is not answered by
+    # this study; every classification arm, on every dataset, consumes
+    # confidence-gated pseudo-masks only.
+    #
+    # use_train_aug below still applies to Stage A: the segmenter continues to
+    # train on the 6x-augmented part set, since that corpus and its role are
+    # unchanged by this switch.
+    cls_corpus: large_cls
+    # Set these two roots to the BeeMachine part-annotated set and the
+    # originals-only classification corpus used in the paper.
+    partwhole_root: "./data/beemachine/partset"
+    large_cls_root: "./data/beemachine/classification"
+    images_subdir: "images"
+    masks_subdir: "masks"
+    class_filename: "species_labels.csv"
+    train_aug_images_subdir: "train_aug_images"
+    train_aug_masks_subdir: "train_aug_masks"
+    train_aug_csv: "segmentation_train_aug.csv"
+    use_train_aug: true
+    # 936 dims: 4 regions (3 parts + full) x shape/appearance + bee inter-part
+    # ratios, plus 3 learned NR-IQA scores (image_iqa_clipiqa/maniqa/musiq)
+    # computed once per image (see descriptors.py::extract_learned_iqa_features).
+    # Was 941, but 5 of those columns were NaN for every image and are no
+    # longer emitted: Q-Align (unloadable under transformers 4.57) and the four
+    # per-region classical NIQE columns (skvideo's NIQE calls the long-removed
+    # scipy.misc.imresize). Reinstating either raises this number again.
+    descriptors:
+      expected_dim: 936
+
+  cub:
+    layout: cub
+    split_policy: stratified_freeze
+    part_labels:
+      - background
+      - body
+      - head
+      - neck
+      - beak
+      - tail
+      - right_wing
+      - left_wing
+      - right_leg
+      - left_leg
+      - right_eye
+      - left_eye
+    # CUB classification runs on the full 200-class corpus with confidence-gated
+    # pseudo-masks, NOT the 67-class / 1,888-image part set. The part set stays
+    # Stage A's training data (that is what it is for); using it as a
+    # classification target as well produced a 67-class, 191-image test task
+    # that cannot be compared with any published CUB result, and whose CIs were
+    # +/- 3 points because one test image is 0.52%.
+    #
+    # The consequence, stated rather than worked around: CUB has no
+    # ground-truth mask regime, because GT masks exist for 1,888 of 11,788
+    # images. Its fusion arms run under pseudo-masks only, and no dataset in
+    # this study answers a GT-to-predicted ranking question (Beemachine's
+    # part set is Stage-A-only too; see its cls_corpus comment above).
+    cls_corpus: large_cls
+    partwhole_root: "./data/cub"
+    large_cls_root: "./data/cub"
+    # Original GT RGB + per-part AnnotationMasksPerclass (reference-protocol on-the-fly
+    # combine). `masks_subdir` is the only key `data.py::build_part_dataset`
+    # reads for this; there used to be a second `annotation_masks_subdir` key
+    # with the identical value that nothing ever read -- removed rather than
+    # wired in, since a config key that can never legitimately differ from
+    # `masks_subdir` is a drift risk with no upside.
+    images_subdir: "images"
+    masks_subdir: "AnnotationMasksPerclass"
+    large_images_subdir: "images"
+    part_labels_file: "part_labels.txt"
+    train_aug_images_subdir: "train_aug_images"
+    train_aug_masks_subdir: "train_aug_masks"
+    train_aug_csv: ""
+    use_train_aug: true
+    descriptors:
+      expected_dim: 0   # validated dynamically (N-part generalized vector)
+
+  fish_vista:
+    layout: fish_vista
+    split_policy: official_csv
+    part_labels:
+      - Background
+      - Head
+      - Eye
+      - Dorsal fin
+      - Pectoral fin
+      - Pelvic fin
+      - Anal fin
+      - Caudal fin
+      - Adipose fin
+      - Barbel
+    cls_corpus: large_cls
+    partwhole_root: "./data/fish_vista"
+    large_cls_root: "./data/fish_vista"
+    images_subdir: "Images"
+    masks_subdir: "segmentation_masks/images"
+    train_aug_images_subdir: "train_aug_images"
+    train_aug_masks_subdir: "train_aug_masks"
+    seg_train_csv: "segmentation_train.csv"
+    seg_train_aug_csv: "segmentation_train_aug.csv"
+    seg_val_csv: "segmentation_val.csv"
+    seg_test_csv: "segmentation_test.csv"
+    cls_train_csv: "classification_train.csv"
+    cls_val_csv: "classification_val.csv"
+    cls_test_csv: "classification_test.csv"
+    trait_map_file: "segmentation_masks/seg_id_trait_map.json"
+    use_train_aug: true
+    descriptors:
+      expected_dim: 0
+
+# Fallback part_labels (overridden by active dataset)
+part_labels: ["background", "abdomen", "head", "thorax"]
+
+segmentation:
+  # Default single-run model
+  arch: "deeplabv3plus"
+  encoder: "resnext50_32x4d"
+  backend: "smp"
+  epochs: 200
+  batch_size: 128
+  lr: 1.0e-4
+  # Cosine period, in epochs, for CosineAnnealingLR(eta_min=1e-5). Deliberately
+  # NOT `epochs`: Stage A early-stops on validation mIoU well before the 200
+  # ceiling (the 2026-08 sweep ended between epochs 22 and 94), so a T_max equal
+  # to the ceiling meant the anneal never completed for a single run -- the LR
+  # was still at 0.65-0.9x base when training stopped. 50 matches the reference
+  # protocol (Choton et al., 2026) and completes an anneal every 50 epochs
+  # regardless of where the run ends. See segmenters.cosine_t_max.
+  t_max: 50
+  # Epochs without val mIoU improvement before Stage A stops. Raised from 20
+  # after the 2026-08 sweep stopped several arms on noise rather than
+  # convergence: MaNet/beemachine took its best at epoch 5 and halted at 26.
+  # Macro mIoU is a noisy monitor because it weights rare parts (CUB
+  # legs/eyes, Fish barbel) equally with background, so it needs a wider
+  # window than a loss would.
+  # Set to 0 to disable early stopping and run the full `epochs` budget.
+  patience: 40
+  # Full Stage A sweep. **Encoder is held fixed at resnext50_32x4d** across
+  # every SMP decoder so the table is a decoder comparison, matching the
+  # reference protocol. The previous list varied encoder *and* decoder
+  # (fpn/efficientnet-b4, linknet/resnet34, segformer/mit_b2, ...), which meant
+  # a row like "SegFormer beats FPN" confounded the two factors and only 2 of
+  # the 9 rows were like-for-like with prior work. All nine decoders are
+  # verified to build and forward at 320px on this encoder.
+  models:
+    - {backend: smp, arch: deeplabv3plus, encoder: resnext50_32x4d}
+    - {backend: smp, arch: fpn, encoder: resnext50_32x4d}
+    - {backend: smp, arch: linknet, encoder: resnext50_32x4d}
+    - {backend: smp, arch: manet, encoder: resnext50_32x4d}
+    - {backend: smp, arch: pan, encoder: resnext50_32x4d}
+    - {backend: smp, arch: pspnet, encoder: resnext50_32x4d}
+    - {backend: smp, arch: segformer, encoder: resnext50_32x4d}
+    - {backend: smp, arch: unetplusplus, encoder: resnext50_32x4d}
+    - {backend: smp, arch: upernet, encoder: resnext50_32x4d}
+  # Optional second sweep: best-achievable segmenter per decoder, encoder free.
+  # Not run by default; `stage_a.py sweep --models_key models_encoder_free`
+  # produces the companion table if you want it.
+  models_encoder_free:
+    - {backend: smp, arch: fpn, encoder: efficientnet-b4}
+    - {backend: smp, arch: linknet, encoder: resnet34}
+    - {backend: smp, arch: manet, encoder: efficientnet-b4}
+    - {backend: smp, arch: pan, encoder: resnet50}
+    - {backend: smp, arch: segformer, encoder: mit_b2}
+    - {backend: smp, arch: upernet, encoder: resnet50}
+
+classification:
+  # Per-backbone native input resolution. Deliberately empty: the controlled
+  # comparison pins every arm to one backbone at one resolution, so the fusion
+  # mechanism is the only free variable. An entry here re-introduces a
+  # resolution confound between arms and must not be added without a
+  # corresponding statement in the paper's protocol section.
+  #
+  # This previously pinned one backbone to its own native resolution so the
+  # arm would reproduce a published deployment "as served". That framing was
+  # dropped, and with it the only reason any arm differed from the rest in
+  # input size.
+  image_size_overrides: {}
+  backbones:
+    - "convnext_nano.in12k"
+    - "deit_base_distilled_patch16_224.fb_in1k"
+    - "efficientnetv2_rw_s.ra2_in1k"
+    - "efficientnetv2_rw_m.agc_in1k"
+    - "inception_next_tiny.sail_in1k"
+    - "resnet101.a1_in1k"
+    - "seresnext101_32x4d.gluon_in1k"
+    - "swin_base_patch4_window7_224.ms_in1k"
+  epochs: 100
+  batch_size: 64
+  lr: 1.0e-4
+  # Epochs without validation-loss improvement before a classification arm
+  # stops. Applies to every Stage B and Stage C training loop -- the three
+  # hand-rolled ones via `metrics.EarlyStopper` and the multitask arm via
+  # Lightning -- so `epochs` above is now a ceiling, not an exact budget.
+  #
+  # Validation LOSS, not accuracy: it is the signal these loops already use for
+  # ReduceLROnPlateau and for best-checkpoint selection, so the epoch training
+  # stops on and the epoch that gets kept are judged by one metric. Accuracy is
+  # much noisier on the small validation folds here (CUB's is 258 images, where
+  # a single image moves it 0.4%).
+  #
+  # Set to 0 to disable and run the full budget.
+  patience: 20
+  # Applied by every Stage B / Stage C arm through metrics.make_cls_criterion,
+  # including the heavy-augmentation control (where it composes with the
+  # Mixup/CutMix soft targets). 0.1 matches the reference protocol (Choton et
+  # al., 2026); this repo trained at 0.0 through the 2026-08 campaign, which
+  # made every arm's loss differ from the numbers it is being compared against.
+  label_smoothing: 0.1
+  optimizer: "AdamW"
+
+  # The multi-task arm's auxiliary segmentation head.
+  #
+  # NOT `segmentation.arch` / `segmentation.encoder`. Those two configure Stage
+  # A -- the nine-decoder sweep and the frozen segmenter that produces the
+  # pseudo-masks -- where ResNeXt-50 is pinned on purpose so the decoder is the
+  # only variable. The multi-task arm is not a Stage A segmenter: it is one of
+  # the seven CLASSIFICATION arms of the controlled grid, and its shared
+  # encoder is the visual backbone its top-1 is credited to. Reading Stage A's
+  # encoder here is what made it the one arm running on DeepLabV3+/ResNeXt-50
+  # while the other six ran on ConvNeXt-Nano, so an "anatomy" advantage and a
+  # backbone advantage could not be told apart (paper: Sections `sec:setup`,
+  # `app:limitations`).
+  #
+  # `tu-` is segmentation_models_pytorch's timm-universal prefix, so the
+  # encoder here is the same `convnext_nano.in12k` checkpoint every other arm
+  # loads through timm: verified tensor-by-tensor, 142 of 144 state-dict
+  # entries identical, the two absent being `head.norm.{weight,bias}`, which
+  # this arm replaces with the LayerNorm in its own classification head.
+  # Normalization matches too (mean 0.485/0.456/0.406, std 0.229/0.224/0.225).
+  #
+  # DeepLabV3+ is kept as the decoder so only the encoder moved. Verified to
+  # build and forward on this encoder at 224 and 320 with batch >= 2; note that
+  # its ASPP image-pooling branch has a BatchNorm over a 1x1 map, so a
+  # batch-size-1 training step raises "Expected more than 1 value per channel".
+  # No configured dataset trains at batch 1 (classification.batch_size is 64,
+  # auto_batch_size only ever lowers it toward >= 2), but a dataset whose last
+  # batch is a single image needs drop_last, not a decoder change.
+  multitask:
+    arch: "deeplabv3plus"
+    encoder: "tu-convnext_nano.in12k"
+
+descriptors:
+  # Overridden by datasets.<name>.descriptors.expected_dim when set (>0)
+  expected_dim: 936
+  # NOTE: the descriptor ablation groups are not configured here. `ablate`
+  # uses its own default of ["all", "shape", "appearance", "interpart"] -- see
+  # stage_b.cmd_ablate.
+  # Width of the conv shape-encoder's output embedding, i.e. the shape half of
+  # the gated arm. 512 matches the reference implementation; see
+  # fusion.PartAwareFusionClassifier.
+  shape_embed_dim: 512
+  # Deep-fusion arms compared in Stage B+ / Stage C. attention_parts pools
+  # the same K-part crop stack used by the partcrop late-fusion baseline
+  # with learned softmax attention instead of concatenation.
+  fusion_modes:
+    - "descriptors_only"
+    - "concat"
+    - "gated_residual"
+    - "attention_parts"
+  # Modes `ablate` runs only on the complete descriptor vector ("all"), instead
+  # of sub-ablating them across shape / appearance / interpart as well.
+  #
+  # attention_parts consumes the K+1 crop stack, so each of its runs costs K+1
+  # backbone passes per image -- roughly 4x a single-pass arm on Beemachine.
+  # At the full grid it was 12 of `ablate`'s 48 jobs but ~137 of its ~215
+  # GPU-hours (64%), spent producing a per-descriptor-group breakdown of an arm
+  # the inference-cost analysis already excludes from deployment. It keeps its
+  # "all" cell, so the mechanism comparison and the attention-vs-concatenation
+  # aggregation contrast are both unaffected; only the per-group rows are
+  # dropped. Empty this list to restore the full grid.
+  all_group_only_modes: ["attention_parts"]
+  # Learned NR-IQA metrics added to phi_q (see descriptors.py), aligned with
+  # the no-reference IQA suite used for perceptual scoring in the NTIRE 2026
+  # challenge report (arXiv:2604.10532, Sec. 2.2.2).
+  #
+  # Q-Align is absent on purpose. It cannot load under transformers 4.57: its
+  # weights ship as remote code written against the pre-4.49 Llama attention
+  # API. pyiqa 0.1.16 does not help -- it requires transformers>=5.0, which
+  # would break timm. Until then this is a 3-metric branch. It previously
+  # *looked* like 4 only because a
+  # bare `except` turned the load failure into an all-NaN column; extraction
+  # now validates every metric up front and refuses to run if one is broken.
+  learned_iqa_metrics: ["clipiqa", "maniqa", "musiq"]
+  # Images per learned-IQA forward pass. Helps CLIPIQA (18.9 -> 2.6 ms/img)
+  # and MUSIQ (13.5 -> 5.3); MANIQA is unaffected because its published
+  # protocol already averages 20 random crops per image, which saturates the
+  # GPU on its own. Left at its default so the metric stays comparable to
+  # published numbers.
+  iqa_batch_size: 16
+  # Abort extraction if any descriptor column is NaN for every image. A dead
+  # column keeps the dimensionality looking right while contributing nothing
+  # to any fusion arm; both metrics that failed this way went unnoticed for
+  # exactly that reason. Set false to downgrade to a warning.
+  strict_columns: true
+  # If true, phi is scaled by a per-region reliability weight before fusion
+  # (Phi_hat = w_conf * Phi); one arm of the weighted-vs-unweighted
+  # descriptor-aggregation ablation, not a proposed method.
+  confidence_weighted: false
+
+pseudo_labeling:
+  conf_thresholds: [0.5, 0.7, 0.9]
+  batch_size: 64
+
+metrics:
+  primary: ["top1", "top3", "macro_f1"]
+  # Frequency-bin edges, in training images per class. `quantile` derives them
+  # from the corpus at equal class quantiles instead, which is the default
+  # because fixed edges do not survive a change of corpus size: [5, 30, 90] was
+  # calibrated for Beemachine's 195k corpus and put every CUB part-set class in
+  # the single 5-29 bin, so three of the four bins reported n=0 and the fourth
+  # reproduced overall accuracy. Set explicit edges (e.g. [5, 30, 90]) to pin
+  # them for a specific table.
+  long_tail_bins: quantile
+  # Bootstrap resamples for CI / paired significance (stage_report.py).
+  bootstrap_n: 2000
+  ece_bins: 15
+  selective_coverages: [0.1, 0.2, 0.3, 0.5, 0.7, 0.9, 1.0]
+
+robustness:
+  # Synthetic corruptions swept by `stage_d.py robustness` (metrics.py::CORRUPTION_KINDS).
+  kinds: ["gaussian_noise", "gaussian_blur", "brightness", "contrast", "jpeg_block", "occlusion"]
+  severities: [1, 3, 5]
